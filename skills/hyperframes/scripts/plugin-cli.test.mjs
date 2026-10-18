@@ -14,17 +14,22 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { invocation, pluginVersion } from "./plugin-cli.mjs";
 
-function fixture(t, manifest = "plugin.json", version = "1.2.3") {
+function fixture(
+  t,
+  manifest = "plugin.json",
+  version = "1.2.3",
+  scripts = "skills/hyperframes/scripts",
+) {
   const root = mkdtempSync(join(tmpdir(), "hf-plugin-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, "skills/hyperframes/scripts/lib"), { recursive: true });
+  mkdirSync(join(root, scripts, "lib"), { recursive: true });
   mkdirSync(join(root, manifest, ".."), { recursive: true });
   writeFileSync(join(root, manifest), JSON.stringify({ name: "hyperframes", version }));
-  const launcher = join(root, "skills/hyperframes/scripts/plugin-cli.mjs");
+  const launcher = join(root, scripts, "plugin-cli.mjs");
   copyFileSync(new URL("./plugin-cli.mjs", import.meta.url), launcher);
   copyFileSync(
     new URL("./lib/main-module.mjs", import.meta.url),
-    join(root, "skills/hyperframes/scripts/lib/main-module.mjs"),
+    join(root, scripts, "lib/main-module.mjs"),
   );
   return { root, launcher };
 }
@@ -38,15 +43,33 @@ for (const manifest of [
 ]) {
   test(`locates ${manifest} without repository packages`, (t) => {
     const { root } = fixture(t, manifest);
-    assert.equal(pluginVersion(root), "1.2.3");
+    assert.equal(pluginVersion([root]), "1.2.3");
   });
 }
 
 test("rejects missing and floating plugin versions", (t) => {
   const { root } = fixture(t, "plugin.json", "latest");
-  assert.throws(() => pluginVersion(root), /Invalid HyperFrames plugin release/);
+  assert.throws(() => pluginVersion([root]), /Invalid HyperFrames plugin release/);
   rmSync(join(root, "plugin.json"));
-  assert.throws(() => pluginVersion(root), /No HyperFrames plugin manifest/);
+  assert.throws(() => pluginVersion([root]), /No HyperFrames plugin manifest/);
+});
+
+test("a bundle packaged from skills/ reads its own manifest before one above it", (t) => {
+  const { root, launcher } = fixture(
+    t,
+    "bundle/.claude-plugin/plugin.json",
+    "1.2.3",
+    "bundle/hyperframes/scripts",
+  );
+  writeFileSync(
+    join(root, "plugin.json"),
+    JSON.stringify({ name: "hyperframes", version: "9.9.9" }),
+  );
+  const helper = join(root, "helper.mjs");
+  writeFileSync(helper, "console.log(process.env.HYPERFRAMES_PLUGIN_VERSION);");
+  const result = spawnSync(process.execPath, [launcher, "--script", helper], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "1.2.3");
 });
 
 test("pins CLI, suppresses standalone refresh, preserves unrelated environment", () => {

@@ -6,7 +6,9 @@ import { join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isMainModule } from "./lib/main-module.mjs";
 
-const root = fileURLToPath(new URL("../../../", import.meta.url));
+// A release nests this launcher under <root>/skills/, while a marketplace entry with
+// "source": "./skills" makes skills/ itself the plugin root. The nearer root wins.
+const roots = ["../../", "../../../"].map((up) => fileURLToPath(new URL(up, import.meta.url)));
 const manifests = [
   "plugin.json",
   ".claude-plugin/plugin.json",
@@ -15,18 +17,20 @@ const manifests = [
   "gemini-extension.json",
 ];
 
-export function pluginVersion(pluginRoot = root) {
-  for (const path of manifests) {
-    const file = join(pluginRoot, path);
-    if (!existsSync(file)) continue;
-    const manifest = JSON.parse(readFileSync(file, "utf8"));
-    if (
-      manifest.name !== "hyperframes" ||
-      !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version ?? "")
-    ) {
-      throw new Error(`Invalid HyperFrames plugin release: ${file}`);
+export function pluginVersion(pluginRoots = roots) {
+  for (const pluginRoot of pluginRoots) {
+    for (const path of manifests) {
+      const file = join(pluginRoot, path);
+      if (!existsSync(file)) continue;
+      const manifest = JSON.parse(readFileSync(file, "utf8"));
+      if (
+        manifest.name !== "hyperframes" ||
+        !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version ?? "")
+      ) {
+        throw new Error(`Invalid HyperFrames plugin release: ${file}`);
+      }
+      return manifest.version;
     }
-    return manifest.version;
   }
   throw new Error(
     "No HyperFrames plugin manifest found. Use the standalone skills installation instructions.",

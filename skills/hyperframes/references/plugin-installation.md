@@ -1,24 +1,27 @@
 # Running from an installed plugin
 
-Check the directory two levels above the loaded `SKILL.md` for `plugin.json`,
-`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, or
-`.cursor-plugin/plugin.json` identifying `hyperframes`, or a Gemini extension manifest.
-That directory is `<PLUGIN_ROOT>`. If none exists, this is a standalone skill;
-follow the normal installation and freshness instructions.
+Let `<SKILLS_DIR>` be the directory that holds the loaded skill's folder, one level
+above the directory containing the loaded `SKILL.md`. Check `<SKILLS_DIR>` first,
+then its parent, for `plugin.json`, `.claude-plugin/plugin.json`,
+`.codex-plugin/plugin.json`, or `.cursor-plugin/plugin.json` identifying
+`hyperframes`, or a Gemini extension manifest. The first directory with one is
+`<PLUGIN_ROOT>`: `<SKILLS_DIR>` itself in a bundle packaged from `skills/`, its
+parent in a release that nests `skills/`. If neither has one, this is a standalone
+skill; follow the normal installation and freshness instructions.
 
 For a plugin installation, these rules replace the standalone update commands
 in every workflow and reference:
 
 - Do not run `hyperframes skills update`, `skills check`, or `npx skills add`.
   The agent's plugin manager owns installation and updates. Read the workflow at
-  `<PLUGIN_ROOT>/skills/<name>/SKILL.md`; report a missing bundled skill instead
+  `<SKILLS_DIR>/<name>/SKILL.md`; report a missing bundled skill instead
   of downloading a different release. Resolve all skill references inside this
   bundle, even if a standalone copy is also installed. Claude exposes the router
   as `/hyperframes:hyperframes`; other clients may expose `/hyperframes`.
 - Replace `npx hyperframes` (or bare `hyperframes`) in command examples with:
 
   ```bash
-  node "<PLUGIN_ROOT>/skills/hyperframes/scripts/plugin-cli.mjs" <command> <args...>
+  node "<SKILLS_DIR>/hyperframes/scripts/plugin-cli.mjs" <command> <args...>
   ```
 
   Run in the user's project directory, never in the plugin directory. The launcher
@@ -34,8 +37,9 @@ in every workflow and reference:
   downloads, and existing project dependencies have their own versions; a plugin
   version alone does not freeze those inputs.
 - Treat the plugin directory as read-only. Put outputs and temporary work in the
-  project or a temporary directory. Pass this plugin root and launcher convention
-  to any delegated workflow so it does not fall back to global skills.
+  project or a temporary directory. Pass `<SKILLS_DIR>`, `<PLUGIN_ROOT>`, and this
+  launcher convention to any delegated workflow so it does not fall back to global
+  skills.
 
 To get newer skills, use the client's plugin update flow and reload the session.
 Do not silently update an installed plugin during a video task.
