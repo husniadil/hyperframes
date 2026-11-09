@@ -118,9 +118,15 @@ describe("trackCheckReport", () => {
       motionWarnings: 8,
       contrastErrors: 9,
       contrastWarnings: 10,
+      craftWarnings: 16,
       launchSettleMs: 11,
+      renderReadyTimedOut: true,
       seekLoopMs: 12,
       contrastMs: 13,
+      gridMs: 17,
+      craftMs: 18,
+      overlapMs: 19,
+      durationSec: 20,
       gridPoints: 14,
       contrastPoints: 15,
       ok: false,
@@ -144,15 +150,105 @@ describe("trackCheckReport", () => {
       motion_warnings: 8,
       contrast_errors: 9,
       contrast_warnings: 10,
+      craft_warnings: 16,
       launch_settle_ms: 11,
+      render_ready_timed_out: true,
       seek_loop_ms: 12,
       contrast_ms: 13,
+      grid_ms: 17,
+      craft_ms: 18,
+      overlap_ms: 19,
+      composition_s: 20,
       grid_points: 14,
       contrast_points: 15,
       ok: false,
       exit_code: 1,
       run_id: "run-123",
     });
+  });
+
+  it("names the finding that stopped the check, and omits it when none did", () => {
+    const props = {
+      contrastGate: false,
+      motionGate: false,
+      captionZoneGate: false,
+      frameCheckGate: false,
+      snapshotsGate: false,
+      lintErrors: 0,
+      lintWarnings: 0,
+      runtimeErrors: 1,
+      runtimeWarnings: 0,
+      layoutErrors: 0,
+      layoutWarnings: 0,
+      motionErrors: 0,
+      motionWarnings: 0,
+      contrastErrors: 0,
+      contrastWarnings: 0,
+      craftWarnings: 0,
+      launchSettleMs: 0,
+      renderReadyTimedOut: false,
+      seekLoopMs: 0,
+      contrastMs: 0,
+      gridMs: 0,
+      craftMs: 0,
+      overlapMs: 0,
+      durationSec: 0,
+      gridPoints: 0,
+      contrastPoints: 0,
+      ok: false,
+      exitCode: 1,
+    };
+    trackCheckReport({ ...props, stopCode: "media_copies_unfinished" });
+    expect(trackEvent).toHaveBeenLastCalledWith(
+      "check_report",
+      expect.objectContaining({ stop_code: "media_copies_unfinished" }),
+    );
+    trackCheckReport(props);
+    expect(trackEvent.mock.calls.at(-1)?.[1]).not.toHaveProperty("stop_code");
+  });
+
+  it("sends what making browser-playable copies cost as counts and milliseconds, and omits it without videos", () => {
+    const props = {
+      contrastGate: false,
+      motionGate: false,
+      captionZoneGate: false,
+      frameCheckGate: false,
+      snapshotsGate: false,
+      lintErrors: 0,
+      lintWarnings: 0,
+      runtimeErrors: 0,
+      runtimeWarnings: 0,
+      layoutErrors: 0,
+      layoutWarnings: 0,
+      motionErrors: 0,
+      motionWarnings: 0,
+      contrastErrors: 0,
+      contrastWarnings: 0,
+      craftWarnings: 0,
+      launchSettleMs: 0,
+      renderReadyTimedOut: false,
+      seekLoopMs: 0,
+      contrastMs: 0,
+      gridMs: 0,
+      craftMs: 0,
+      overlapMs: 0,
+      durationSec: 0,
+      gridPoints: 0,
+      contrastPoints: 0,
+      ok: true,
+      exitCode: 0,
+    };
+    trackCheckReport({ ...props, mediaCopies: { total: 47, waitedMs: 120_000, unfinished: 12 } });
+    expect(trackEvent).toHaveBeenLastCalledWith(
+      "check_report",
+      expect.objectContaining({
+        copies_total: 47,
+        copies_waited_ms: 120_000,
+        copies_unfinished: 12,
+      }),
+    );
+    trackCheckReport(props);
+    expect(trackEvent.mock.calls.at(-1)?.[1]).not.toHaveProperty("copies_total");
   });
 
   it("omits run_id when no run ID is provided", () => {
@@ -172,9 +268,15 @@ describe("trackCheckReport", () => {
       motionWarnings: 0,
       contrastErrors: 0,
       contrastWarnings: 0,
+      craftWarnings: 0,
       launchSettleMs: 0,
+      renderReadyTimedOut: false,
       seekLoopMs: 0,
       contrastMs: 0,
+      gridMs: 0,
+      craftMs: 0,
+      overlapMs: 0,
+      durationSec: 0,
       gridPoints: 0,
       contrastPoints: 0,
       ok: true,
@@ -982,6 +1084,22 @@ describe("render telemetry events", () => {
     );
   });
 
+  it("reports render_complete de_router_breaker_off when the install's breaker held the router off", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "standard",
+      docker: false,
+      gpu: false,
+      deRouterBreakerOff: true,
+    });
+    expect(trackEvent).toHaveBeenCalledWith(
+      "render_complete",
+      expect.objectContaining({ de_router_breaker_off: true }),
+      undefined,
+    );
+  });
+
   it("emits render_preflight_rejected with the low-cardinality issue kind", () => {
     trackRenderPreflightRejected({ kind: "aspect-mismatch" });
     expect(trackEvent).toHaveBeenCalledWith("render_preflight_rejected", {
@@ -1016,6 +1134,10 @@ describe("render telemetry events", () => {
       stageCaptureSetupMs: 1860,
       stageCaptureFrameMs: 3240,
       captureAvgMs: 27,
+      captureSeekAvgMs: 6,
+      captureBeforeCaptureAvgMs: 2,
+      captureScreenshotAvgMs: 15,
+      encoderWaitAvgMs: 4,
     });
 
     expect(trackEvent).toHaveBeenCalledWith(
@@ -1025,6 +1147,10 @@ describe("render telemetry events", () => {
         stage_capture_setup_ms: 1860,
         stage_capture_frame_ms: 3240,
         capture_avg_ms: 27,
+        capture_seek_avg_ms: 6,
+        capture_before_capture_avg_ms: 2,
+        capture_screenshot_avg_ms: 15,
+        encoder_wait_avg_ms: 4,
       }),
       undefined,
     );
@@ -1361,11 +1487,14 @@ describe("auth login telemetry events", () => {
   });
 
   it("identifyUser emits a $identify alias linking the anon install to the identity", () => {
-    identifyUser("alice@example.com");
+    identifyUser("user-id-1", { email: "alice@example.com", heygen_username: "alice" });
     expect(trackEvent).toHaveBeenCalledWith(
       "$identify",
-      { $anon_distinct_id: "anon-test-123" },
-      "alice@example.com",
+      {
+        $anon_distinct_id: "anon-test-123",
+        $set: { email: "alice@example.com", heygen_username: "alice" },
+      },
+      "user-id-1",
     );
   });
 

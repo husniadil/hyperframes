@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, rm, rmdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import {
   type Dirent,
   type Stats,
@@ -12,7 +12,6 @@ import {
   realpathSync,
   rmSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { replaceFileAtomically } from "@hyperframes/core/atomic-file";
 import {
@@ -30,6 +29,7 @@ import {
   listProjectFiles,
 } from "../helpers/projectSignature.js";
 import { openBlobStore, readBlob, type BlobStore } from "./blobStore.js";
+import { isUncopied, uncopiedOnlyHashes } from "./uncopied.js";
 import { pruneGoneProjectHistoriesDaily } from "./pruneHistories.js";
 import {
   ID_PATH,
@@ -63,9 +63,10 @@ import {
   type LogRecord,
   type Manifest,
 } from "./historyLog.js";
+import { hyperframesCacheDir } from "@hyperframes/core/cache-dir";
 
 /** Where hosts keep project histories unless told otherwise: outside every project, so no tidy-up takes one away. */
-export const DEFAULT_HISTORY_ROOT = join(homedir(), ".cache", "hyperframes", "history");
+export const DEFAULT_HISTORY_ROOT = hyperframesCacheDir("history");
 
 export interface ProjectHistoryOptions {
   projectDir: string;
@@ -82,6 +83,7 @@ export interface ProjectHistoryOptions {
   onError?: (error: unknown) => void;
   /** How long an open waits for another process to close the same history (default 5 s). */
   ownerWaitMs?: number;
+  ownerUrl?: string;
   /** A CLI turn's window from an earlier open: writes since, within its idle limit, become the entry with its id. */
   closedWindow?: ClosedWindow;
   closedWindowAfterOwnership?: () => ClosedWindow | undefined;
@@ -209,6 +211,22 @@ const statKey = (file: { size: number; mtimeMs: number; ctimeMs: number }, swept
   sweptAt - Math.max(file.mtimeMs, file.ctimeMs) < RACY_MS
     ? ""
     : `${file.size}:${file.mtimeMs}:${file.ctimeMs}`;
+
+const FIRST_COPY_SLOTS_IN_PROCESS = 4;
+let firstCopiesRunning = 0;
+const firstCopiesWaiting: (() => void)[] = [];
+
+async function inFirstCopySlot<T>(copy: () => Promise<T>): Promise<T> {
+  if (firstCopiesRunning < FIRST_COPY_SLOTS_IN_PROCESS) firstCopiesRunning += 1;
+  else await new Promise<void>((yours) => firstCopiesWaiting.push(yours));
+  try {
+    return await copy();
+  } finally {
+    const next = firstCopiesWaiting.shift();
+    if (next) next();
+    else firstCopiesRunning -= 1;
+  }
+}
 
 const MEDIA_LEDGER = ".media/manifest.jsonl";
 const KEPT_HIDDEN_PATHS = new Set<string>([...STUDIO_SIGNATURE_MANIFEST_PATHS, MEDIA_LEDGER]);
@@ -459,6 +477,7 @@ class Engine {
     );
     if (!log) return this.firstOpen();
     this.log = withoutHiddenPaths(log);
+    await this.reclaimUncopied();
     if (!this.log.keepsLedger) await this.takeInUnnamedLedger();
     const cache = this.readStatCache();
     const last = this.log.entries.at(-1)?.id ?? START;
@@ -473,6 +492,11 @@ class Engine {
     // What changed while the project was closed is one outside entry, or the closed window's.
     this.reopenClosedWindow();
     await this.settleAll();
+  }
+
+  /** Copies an older version took of files that are no longer copied; text and small files are never touched. */
+  async reclaimUncopied(): Promise<void> {
+    await this.blobs.drop(uncopiedOnlyHashes(this.log, (hash) => this.blobs.size(hash)));
   }
 
   hearWrites(): void {
@@ -490,7 +514,8 @@ class Engine {
         chainBackFrom(this.overwritten.get(path), replaced).set(after, replaced),
       );
       this.queue(async () => {
-        if (!this.blobs.has(replaced)) await this.storeBytes(bytes);
+        if (!this.blobs.has(replaced) && !isUncopied(path, bytes.length))
+          await this.storeBytes(bytes);
       }).catch((error) => this.options.onError?.(error));
     });
   }
@@ -539,11 +564,18 @@ class Engine {
   async firstOpen(): Promise<void> {
     const sweptAt = this.now();
     const files = historyFiles(this.dir);
-    for (const file of files.filter((file) => file.size <= COPY_LATER_ABOVE_BYTES)) {
-      const hash = await this.storeIfPresent(file.path);
-      if (this.whereFolder() !== "here") throw this.replaced();
-      if (hash !== null) this.tracked.set(file.path, { hash, stat: statKey(file, sweptAt) });
-    }
+    const copied = files.filter((file) => file.size <= COPY_LATER_ABOVE_BYTES);
+    const hashes = await Promise.allSettled(
+      copied.map((file) => inFirstCopySlot(() => this.storeIfPresent(file.path))),
+    );
+    // Nothing names these copies until the log below is written, so one look at the end covers the whole copy.
+    if (this.whereFolder() !== "here") throw this.replaced();
+    copied.forEach((file, i) => {
+      const result = hashes[i]!;
+      if (result.status === "rejected") throw result.reason;
+      if (result.value !== null)
+        this.tracked.set(file.path, { hash: result.value, stat: statKey(file, sweptAt) });
+    });
     this.log.baseline = this.manifest();
     this.log.keepsLedger = true;
     this.persistLog();
@@ -588,7 +620,8 @@ class Engine {
   async recordAdopted(file: ListedFile, sweptAt: number, stored: string | null) {
     if (stored === null || this.whereFolder() !== "here") return;
     // A prune that ran while this copy waited for the queue may have taken its bytes.
-    const hash = this.blobs.has(stored) ? stored : await this.storeIfPresent(file.path);
+    const kept = this.blobs.has(stored) || isUncopied(file.path, file.size);
+    const hash = kept ? stored : await this.storeIfPresent(file.path);
     if (hash === null) return;
     const change = { path: file.path, before: null, after: hash };
     const found = this.overwrittenBy(change, undefined, new Set());
@@ -678,7 +711,9 @@ class Engine {
   /** The file's hash once copied in; null when it was removed before the copy (the next sweep records that). */
   async storeIfPresent(path: string): Promise<string | null> {
     try {
-      return await this.blobs.put(join(this.dir, path));
+      const abs = join(this.dir, path);
+      const { size } = await stat(abs);
+      return await (isUncopied(path, size) ? this.blobs.reference(abs) : this.blobs.put(abs));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -1095,6 +1130,16 @@ class Engine {
     const changes = [...target]
       .filter(([path, hash]) => (this.tracked.get(path)?.hash ?? null) !== hash)
       .sort(([, a], [, b]) => Number(a !== null) - Number(b !== null));
+    const setAsideByDeletesFirst = new Set(
+      changes.filter(([, hash]) => hash === null).map(([path]) => this.tracked.get(path)?.hash),
+    );
+    const gone = changes.find(
+      ([, hash]) => hash !== null && !this.blobs.has(hash) && !setAsideByDeletesFirst.has(hash),
+    );
+    if (gone)
+      throw new Error(
+        `An earlier version of ${gone[0]} is not kept, so this cannot be brought back.`,
+      );
     const deleted = new Set(changes.filter(([, hash]) => hash === null).map(([path]) => path));
     const blocked = changes
       .filter(([, hash]) => hash !== null)
@@ -1105,6 +1150,9 @@ class Engine {
     this.windows.push(group);
     try {
       for (const [path, hash] of changes) await this.writeProjectFile(path, hash);
+      await this.blobs.release(
+        changes.flatMap(([path, hash]) => (hash ? [[hash, path] as const] : [])),
+      );
       await this.sweep();
     } finally {
       this.windows = this.windows.filter((open) => open !== group);
@@ -1121,6 +1169,9 @@ class Engine {
       const version = hash === null ? DELETED_VERSION : hashVersion(hash);
       recordFileWriteReceipt(absPath, { path, version, writeToken });
     }
+    const standing = lstatSync(absPath, { throwIfNoEntry: false });
+    if (standing?.isFile() && isUncopied(path, standing.size))
+      await this.blobs.keep(path, absPath, hash === null);
     if (hash === null) {
       this.assertWritable();
       rmSync(absPath, { force: true });
@@ -1221,6 +1272,18 @@ class Engine {
       [...this.tracked.keys()].map((path) => [path, null]),
     );
     for (const [path, hash] of files) target.set(path, hash);
+    if (point === START && this.adopting.size > 0) {
+      throw new HistoryRefusedError(
+        "The project's starting copy is still being saved; try again in a moment. Nothing was changed.",
+      );
+    }
+    const isProjectFile = (path: string) => !KEPT_HIDDEN_PATHS.has(path);
+    const keepsAny = [...target].some(([path, hash]) => hash !== null && isProjectFile(path));
+    if ([...this.tracked.keys()].some(isProjectFile) && !keepsAny) {
+      throw new HistoryRefusedError(
+        "Restoring this point would remove every file in this project, so nothing was changed.",
+      );
+    }
     return this.writeAs(who, label, target, { restoredTo: point });
   }
 
@@ -1287,6 +1350,9 @@ class Engine {
           if ((await readdir(dest).catch(missingIsEmpty)).length > 0)
             throw new Error(`Checkout writes into an empty folder only: ${dest}`);
           const files = manifestAround(this.log, entryId, side)!;
+          for (const [path, hash] of files)
+            if (!this.blobs.has(hash))
+              throw new Error(`The version of ${path} from then is not kept.`);
           try {
             for (const [path, hash] of files) await this.blobs.writeTo(hash, join(dest, path));
           } catch (error) {
@@ -1352,6 +1418,13 @@ export class HistoryClosedError extends Error {
   }
 }
 
+export class HistoryRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HistoryRefusedError";
+  }
+}
+
 /** Opens a project's history: every write to its files becomes an entry that can be undone or restored. */
 export async function openProjectHistory(options: ProjectHistoryOptions): Promise<ProjectHistory> {
   if (!existsSync(options.projectDir))
@@ -1360,6 +1433,7 @@ export async function openProjectHistory(options: ProjectHistoryOptions): Promis
   const release = await takeHistoryOwnership(
     join(options.historyRoot, projectId),
     options.ownerWaitMs ?? 5000,
+    options.ownerUrl,
   );
   try {
     const blobs = await openBlobStore(join(options.historyRoot, projectId, "blobs"));

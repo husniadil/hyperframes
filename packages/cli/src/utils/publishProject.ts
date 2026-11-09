@@ -1,9 +1,21 @@
-import { basename, dirname, join, posix, relative, resolve } from "node:path";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { envProxyEnabled } from "@hyperframes/core/env-proxy";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  type Stats,
+  statSync,
+} from "node:fs";
 import { parseHTML } from "linkedom";
 import AdmZip from "adm-zip";
-import ignore, { type Ignore } from "ignore";
-import { CSS_URL_RE, isNonRelativeUrl, isPathInside } from "@hyperframes/core";
+import type { Ignore } from "ignore";
+import { projectIgnore } from "@hyperframes/lint";
+import { CSS_URL_RE, isNonRelativeUrl, isPathInside, rewriteSrcsetUrls } from "@hyperframes/core";
+import { decodeUrlPathVariants, encodeUrlPath } from "@hyperframes/parsers";
 import { buildAuthHeaders } from "../auth/client.js";
 import { tryResolveCredential } from "../auth/index.js";
 import { isAuthError } from "../auth/errors.js";
@@ -13,12 +25,6 @@ import { writeProjectLink } from "./projectLink.js";
 
 const IGNORED_DIRS = new Set([".git", "node_modules", "dist", ".next", "coverage"]);
 const IGNORED_FILES = new Set([".DS_Store", "Thumbs.db"]);
-const HYPERFRAMES_IGNORE_FILE = ".hyperframesignore";
-// Unanchored (no leading/mid slash) so it matches a dot-prefixed name at any
-// depth, same as the segments it replaces below — but as a matcher pattern
-// instead of a hard skip, a project's own `.hyperframesignore` negation can
-// still override it.
-const DEFAULT_PROJECT_IGNORE = ["/renders/", "/snapshots/", ".*"];
 const PUBLISH_CONTENT_TYPE = "application/zip";
 const PUBLISH_METADATA_TIMEOUT_MS = 30_000;
 const PUBLISH_UPLOAD_MIN_TIMEOUT_MS = 120_000;
@@ -130,25 +136,20 @@ function getUploadHeaders(
     }
   }
 
-  if (!Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) {
-    headers["content-type"] = contentType;
+  setHeaderIfAbsent(headers, "content-type", contentType);
+  const signedHeaders =
+    new URL(uploadUrl).searchParams.get("X-Amz-SignedHeaders")?.split(";") ?? [];
+  if (signedHeaders.includes("x-amz-server-side-encryption")) {
+    setHeaderIfAbsent(headers, "x-amz-server-side-encryption", "AES256");
   }
-
-  const signedHeaders = new URL(uploadUrl).searchParams.get("X-Amz-SignedHeaders");
-  if (
-    signedHeaders?.split(";").includes("x-amz-server-side-encryption") &&
-    !Object.keys(headers).some((key) => key.toLowerCase() === "x-amz-server-side-encryption")
-  ) {
-    headers["x-amz-server-side-encryption"] = "AES256";
+  if (signedHeaders.includes("content-length")) {
+    setHeaderIfAbsent(headers, "content-length", String(archiveByteLength));
   }
-  if (
-    signedHeaders?.split(";").includes("content-length") &&
-    !Object.keys(headers).some((key) => key.toLowerCase() === "content-length")
-  ) {
-    headers["content-length"] = String(archiveByteLength);
-  }
-
   return headers;
+}
+
+function setHeaderIfAbsent(headers: Record<string, string>, name: string, value: string): void {
+  if (!Object.keys(headers).some((key) => key.toLowerCase() === name)) headers[name] = value;
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -184,7 +185,9 @@ export async function resolvePublishCredential(
     const expired =
       credential.type === "oauth" && isTokenExpired(credential.expires_at, new Date());
     if (expired && !credential.refresh_token) throw new Error(LOGIN_EXPIRED);
-    return await refreshIfNeeded(expired ? { ...credential, refreshable: true } : credential);
+    return await refreshIfNeeded(expired ? { ...credential, refreshable: true } : credential, {
+      envFallback: checked === undefined,
+    });
   } catch (error) {
     if (isAuthError(error) && (error.code === "REFRESH_FAILED" || error.code === "LOGIN_EXPIRED")) {
       throw new Error(LOGIN_EXPIRED);
@@ -230,11 +233,7 @@ function proxySupportHint(): string {
   const proxyConfigured = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"].some((key) =>
     Boolean(process.env[key]?.trim()),
   );
-  const proxyEnabled =
-    process.env["NODE_USE_ENV_PROXY"] === "1" ||
-    process.execArgv.includes("--use-env-proxy") ||
-    process.env["NODE_OPTIONS"]?.split(/\s+/u).includes("--use-env-proxy") === true;
-  if (!proxyConfigured || proxyEnabled) return "";
+  if (!proxyConfigured || envProxyEnabled()) return "";
   return (
     ". Proxy variables are set but ignored by Node fetch; if this network requires them, retry with " +
     "NODE_USE_ENV_PROXY=1 (Node 22.21+)"
@@ -297,19 +296,10 @@ export function uploadTimeoutMs(byteLength: number): number {
 
 // Absolute, non-negotiable exclusions only — anything a `.hyperframesignore`
 // negation rule should be able to override (including dot-prefixed paths;
-// see DEFAULT_PROJECT_IGNORE) must go through the ignore matcher instead of
+// see projectIgnore) must go through the ignore matcher instead of
 // short-circuiting here.
 function shouldIgnoreSegment(segment: string): boolean {
   return IGNORED_DIRS.has(segment) || IGNORED_FILES.has(segment);
-}
-
-function createProjectIgnore(rootDir: string): Ignore {
-  const matcher = ignore().add(DEFAULT_PROJECT_IGNORE);
-  const ignorePath = join(rootDir, HYPERFRAMES_IGNORE_FILE);
-  if (existsSync(ignorePath)) {
-    matcher.add(readFileSync(ignorePath, "utf-8"));
-  }
-  return matcher;
 }
 
 function collectProjectFiles(
@@ -338,9 +328,66 @@ function collectProjectFiles(
 
 const EXT_ASSETS_PREFIX = "_ext";
 
+/** Files whose text a reference rewrite or scan reads; they are always staged in memory. */
+export const TEXT_FILE_EXTS = /\.(html?|css|m?js|cjs|json|svg|xml|txt)$/i;
+
+/** A large non-text project file left on disk; `size` and `mtimeMs` detect an edit after staging. */
+export interface DiskFile {
+  absPath: string;
+  size: number;
+  mtimeMs: number;
+}
+
+export type StagedFile = Buffer | DiskFile;
+
+export function stagedSize(file: StagedFile): number {
+  return Buffer.isBuffer(file) ? file.byteLength : file.size;
+}
+
+function assertSame(file: DiskFile, now: Stats | undefined): void {
+  if (now?.size !== file.size || now.mtimeMs !== file.mtimeMs) {
+    throw new Error(`${file.absPath} changed on disk while it was being prepared. Run it again.`);
+  }
+}
+
+export function assertUnchanged(file: DiskFile): void {
+  assertSame(file, statSync(file.absPath, { throwIfNoEntry: false }));
+}
+
+/** Reads through one descriptor, so `check` (run before and after) sees the stat of the bytes returned. */
+export function readChecked(path: string, check: (stat: Stats) => void): Buffer {
+  const fd = openSync(path, "r");
+  try {
+    check(fstatSync(fd));
+    const bytes = readFileSync(fd);
+    check(fstatSync(fd));
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The staged bytes; a file left on disk is read now and must not have changed since staging. */
+export function readStaged(file: StagedFile): Buffer {
+  if (Buffer.isBuffer(file)) return file;
+  return readChecked(file.absPath, (stat) => assertSame(file, stat));
+}
+
+function stageFile(absPath: string, onDiskMinBytes: number): StagedFile {
+  const fd = openSync(absPath, "r");
+  try {
+    const { size, mtimeMs } = fstatSync(fd);
+    if (size < onDiskMinBytes || TEXT_FILE_EXTS.test(absPath)) return readFileSync(fd);
+    return { absPath, size, mtimeMs };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 interface ExternalAssetContext {
   absProjectDir: string;
-  fileContents: Map<string, Buffer>;
+  fileContents: Map<string, StagedFile>;
+  onDiskMinBytes: number;
   externalMap: Map<string, string>;
   usedArchivePaths: Set<string>;
 }
@@ -351,7 +398,7 @@ function addExternalAsset(ctx: ExternalAssetContext, absPath: string): string {
 
   const rel = relative(ctx.absProjectDir, absPath).replaceAll("\\", "/");
   const stripped = rel.replace(/^(?:\.\.\/)+/, "");
-  let archivePath = `${EXT_ASSETS_PREFIX}/${stripped}`;
+  let archivePath = archiveKey(`${EXT_ASSETS_PREFIX}/${stripped}`);
 
   if (ctx.usedArchivePaths.has(archivePath)) {
     const ext = posix.extname(archivePath);
@@ -361,47 +408,106 @@ function addExternalAsset(ctx: ExternalAssetContext, absPath: string): string {
     archivePath = `${base}_${i}${ext}`;
   }
 
-  ctx.fileContents.set(archivePath, readFileSync(absPath));
+  ctx.fileContents.set(archivePath, stageFile(absPath, ctx.onDiskMinBytes));
   ctx.externalMap.set(absPath, archivePath);
   ctx.usedArchivePaths.add(archivePath);
   return archivePath;
+}
+
+/** Ships a referenced in-project file the ignore rules skipped, resolved from its folder or the root. */
+function includeReferencedProjectFile(
+  ctx: ExternalAssetContext,
+  resolvedPath: string,
+  rawPath: string,
+  requireOnDisk: boolean,
+): void {
+  const fromRoot = resolve(ctx.absProjectDir, rawPath);
+  for (const candidate of [resolvedPath, fromRoot]) {
+    const absPath = candidate.replace(/[?#].*$/, "");
+    if (!isPathInside(absPath, ctx.absProjectDir)) continue;
+    const rel = archiveKey(relative(ctx.absProjectDir, absPath).replaceAll("\\", "/"));
+    if (!rel || ctx.fileContents.has(rel) || rel.split("/").some(shouldIgnoreSegment)) return;
+    if (!existsSync(absPath)) continue;
+    if (statSync(absPath).isFile()) {
+      ctx.fileContents.set(rel, stageFile(absPath, ctx.onDiskMinBytes));
+    }
+    return;
+  }
+  if (!requireOnDisk) return;
+  throw new Error(`The composition references "${rawPath}", which is not in the project folder.`);
+}
+
+/** References with no fallback: a missing file here cannot render. */
+const HARD_REFERENCES = new Set(["video[src]", "audio[src]", "img[src]", "video[poster]"]);
+
+const relativeToProject = (ctx: ExternalAssetContext, absPath: string) =>
+  encodeUrlPath(relative(ctx.absProjectDir, absPath).replaceAll("\\", "/"));
+
+function archiveTargetOf(
+  ctx: ExternalAssetContext,
+  absPath: string,
+  rawPath: string,
+  options: { requireOnDisk: boolean; filesystemPath: boolean },
+): string | null | undefined {
+  if (isPathInside(absPath, ctx.absProjectDir)) {
+    includeReferencedProjectFile(ctx, absPath, rawPath, options.requireOnDisk);
+    return options.filesystemPath ? relativeToProject(ctx, absPath) : null;
+  }
+  try {
+    if (!existsSync(absPath) || !statSync(absPath).isFile()) return undefined;
+  } catch {
+    return undefined;
+  }
+  return encodeUrlPath(addExternalAsset(ctx, absPath));
 }
 
 function tryResolveExternal(
   ctx: ExternalAssetContext,
   rawPath: string,
   referrerAbsDir: string,
+  requireOnDisk = false,
 ): string | null {
-  if (isNonRelativeUrl(rawPath)) return null;
-  const absPath = resolve(referrerAbsDir, rawPath);
-  if (isPathInside(absPath, ctx.absProjectDir)) return null;
-  try {
-    if (!existsSync(absPath) || !statSync(absPath).isFile()) return null;
-  } catch {
-    return null;
+  const filesystemPath = isAbsolute(rawPath) && !rawPath.startsWith("//");
+  if (isNonRelativeUrl(rawPath) && !filesystemPath) return null;
+  const cut = filesystemPath ? rawPath.search(/[?#]/) : -1;
+  const [path, suffix] = cut < 0 ? [rawPath, ""] : [rawPath.slice(0, cut), rawPath.slice(cut)];
+  for (const variant of decodeUrlPathVariants(path)) {
+    const target = archiveTargetOf(ctx, resolve(referrerAbsDir, variant), rawPath, {
+      requireOnDisk,
+      filesystemPath,
+    });
+    if (target !== undefined) return target && target + suffix;
   }
-  return addExternalAsset(ctx, absPath);
+  return null;
 }
 
-function rewriteCssUrls(
-  ctx: ExternalAssetContext,
+/** Resolves a raw attribute or CSS `url()` value to the archive path or absolute
+ * URL it should point at, or `null` to leave it untouched. */
+export type HtmlAttributeResolver = (
+  rawValue: string,
+  referrerAbsDir: string,
+  ref?: { attr: string; tag: string },
+) => string | null;
+
+function referenceFrom(entryPath: string, target: string): string {
+  return isNonRelativeUrl(target) ? target : posix.relative(posix.dirname(entryPath), target);
+}
+
+export function rewriteCssUrls(
   css: string,
   referrerAbsDir: string,
   entryPath: string,
+  resolveTarget: HtmlAttributeResolver,
 ): { css: string; modified: boolean } {
   let modified = false;
   const rewritten = css.replace(CSS_URL_RE, (full, quote: string, rawUrl: string) => {
-    const archivePath = tryResolveExternal(ctx, (rawUrl || "").trim(), referrerAbsDir);
-    if (!archivePath) return full;
+    const target = resolveTarget((rawUrl || "").trim(), referrerAbsDir);
+    if (!target) return full;
     modified = true;
-    return `url(${quote || ""}${posix.relative(posix.dirname(entryPath), archivePath)}${quote || ""})`;
+    return `url(${quote || ""}${referenceFrom(entryPath, target)}${quote || ""})`;
   });
   return { css: rewritten, modified };
 }
-
-/** Resolves a raw attribute value (plus the referrer's absolute directory) to
- * the archive path it should point at, or `null` to leave it untouched. */
-export type HtmlAttributeResolver = (rawValue: string, referrerAbsDir: string) => string | null;
 
 interface RewriteHtmlAttributesOptions {
   /** Attributes to inspect (default: src + href, matching the external-asset
@@ -436,26 +542,26 @@ export function rewriteHtmlAttributes(
     for (const attr of attrs) {
       const val = (el.getAttribute(attr) || "").trim();
       if (!val) continue;
-      const archivePath = resolveTarget(val, referrerAbsDir);
-      if (!archivePath) continue;
-      el.setAttribute(attr, posix.relative(posix.dirname(entryPath), archivePath));
+      const target = resolveTarget(val, referrerAbsDir, { attr, tag: el.localName });
+      if (!target) continue;
+      el.setAttribute(attr, referenceFrom(entryPath, target));
       modified = true;
     }
   }
   return modified;
 }
 
-function rewriteStyleBlocks(
-  ctx: ExternalAssetContext,
+export function rewriteStyleBlocks(
   document: Document,
   referrerAbsDir: string,
   entryPath: string,
+  resolveTarget: HtmlAttributeResolver,
 ): boolean {
   let modified = false;
   for (const styleEl of document.querySelectorAll("style")) {
     const css = styleEl.textContent || "";
     if (!css.includes("url(")) continue;
-    const result = rewriteCssUrls(ctx, css, referrerAbsDir, entryPath);
+    const result = rewriteCssUrls(css, referrerAbsDir, entryPath, resolveTarget);
     if (result.modified) {
       styleEl.textContent = result.css;
       modified = true;
@@ -464,7 +570,7 @@ function rewriteStyleBlocks(
   for (const el of document.querySelectorAll("[style]")) {
     const style = el.getAttribute("style") || "";
     if (!style.includes("url(")) continue;
-    const result = rewriteCssUrls(ctx, style, referrerAbsDir, entryPath);
+    const result = rewriteCssUrls(style, referrerAbsDir, entryPath, resolveTarget);
     if (result.modified) {
       el.setAttribute("style", result.css);
       modified = true;
@@ -473,14 +579,43 @@ function rewriteStyleBlocks(
   return modified;
 }
 
+function rewriteHtmlSrcsets(
+  document: Document,
+  referrerAbsDir: string,
+  entryPath: string,
+  resolveTarget: HtmlAttributeResolver,
+): boolean {
+  let modified = false;
+  for (const el of document.querySelectorAll("[srcset]")) {
+    const srcset = el.getAttribute("srcset");
+    if (!srcset) continue;
+    const rewritten = rewriteSrcsetUrls(srcset, (url) => {
+      const target = resolveTarget(url, referrerAbsDir);
+      return target ? referenceFrom(entryPath, target) : url;
+    });
+    if (rewritten === srcset) continue;
+    el.setAttribute("srcset", rewritten);
+    modified = true;
+  }
+  return modified;
+}
+
 function localizeHtmlEntry(ctx: ExternalAssetContext, entryPath: string, content: Buffer): void {
   const referrerAbsDir = resolve(ctx.absProjectDir, dirname(entryPath));
   const { document } = parseHTML(content.toString("utf-8"));
-  const attrsChanged = rewriteHtmlAttributes(document, referrerAbsDir, entryPath, (val, dir) =>
-    tryResolveExternal(ctx, val, dir),
-  );
-  const stylesChanged = rewriteStyleBlocks(ctx, document, referrerAbsDir, entryPath);
-  if (attrsChanged || stylesChanged) {
+  const resolveTarget: HtmlAttributeResolver = (val, dir, ref) =>
+    tryResolveExternal(
+      ctx,
+      val,
+      dir,
+      ref !== undefined && HARD_REFERENCES.has(`${ref.tag}[${ref.attr}]`),
+    );
+  const attrsChanged = rewriteHtmlAttributes(document, referrerAbsDir, entryPath, resolveTarget, {
+    attrs: ["src", "href", "poster"],
+  });
+  const stylesChanged = rewriteStyleBlocks(document, referrerAbsDir, entryPath, resolveTarget);
+  const srcsetsChanged = rewriteHtmlSrcsets(document, referrerAbsDir, entryPath, resolveTarget);
+  if (attrsChanged || stylesChanged || srcsetsChanged) {
     ctx.fileContents.set(entryPath, Buffer.from(document.toString(), "utf-8"));
   }
 }
@@ -489,7 +624,9 @@ function localizeCssEntry(ctx: ExternalAssetContext, entryPath: string, content:
   const referrerAbsDir = resolve(ctx.absProjectDir, dirname(entryPath));
   const css = content.toString("utf-8");
   if (!css.includes("url(")) return;
-  const result = rewriteCssUrls(ctx, css, referrerAbsDir, entryPath);
+  const result = rewriteCssUrls(css, referrerAbsDir, entryPath, (val, dir) =>
+    tryResolveExternal(ctx, val, dir),
+  );
   if (result.modified) {
     ctx.fileContents.set(entryPath, Buffer.from(result.css, "utf-8"));
   }
@@ -502,17 +639,19 @@ function localizeCssEntry(ctx: ExternalAssetContext, entryPath: string, content:
  */
 export function localizeExternalAssets(
   absProjectDir: string,
-  fileContents: Map<string, Buffer>,
+  fileContents: Map<string, StagedFile>,
+  onDiskMinBytes = Infinity,
 ): number {
   const ctx: ExternalAssetContext = {
     absProjectDir,
     fileContents,
+    onDiskMinBytes,
     externalMap: new Map(),
     usedArchivePaths: new Set(),
   };
 
   for (const [entryPath, content] of [...fileContents.entries()]) {
-    if (entryPath.startsWith(EXT_ASSETS_PREFIX + "/")) continue;
+    if (entryPath.startsWith(EXT_ASSETS_PREFIX + "/") || !Buffer.isBuffer(content)) continue;
     if (entryPath.endsWith(".html") || entryPath.endsWith(".htm")) {
       localizeHtmlEntry(ctx, entryPath, content);
     } else if (entryPath.endsWith(".css")) {
@@ -531,21 +670,59 @@ export function localizeExternalAssets(
  * keeps calling `createPublishArchive` directly.
  */
 export function buildPublishFileMap(projectDir: string): Map<string, Buffer> {
+  return stagePublishFiles(projectDir, Infinity) as Map<string, Buffer>;
+}
+
+export const archiveKey = (path: string): string => path.normalize("NFC");
+
+function composeNamesInText(fileContents: Map<string, StagedFile>, filePaths: string[]): void {
+  const names = new Map<string, string>();
+  for (const segment of filePaths.flatMap((path) => path.split("/"))) {
+    const composed = archiveKey(segment);
+    if (composed === segment) continue;
+    names.set(segment, composed);
+    names.set(encodeURIComponent(segment), encodeURIComponent(composed));
+  }
+  if (names.size === 0) return;
+  for (const [key, file] of fileContents) {
+    if (!Buffer.isBuffer(file) || !TEXT_FILE_EXTS.test(key)) continue;
+    let text = file.toString("utf-8");
+    const before = text;
+    for (const [from, to] of names) text = text.replaceAll(from, to);
+    if (text !== before) fileContents.set(key, Buffer.from(text, "utf-8"));
+  }
+}
+
+/** {@link buildPublishFileMap}, but non-text files of `onDiskMinBytes` or more stay on disk. */
+export function stagePublishFiles(
+  projectDir: string,
+  onDiskMinBytes: number,
+): Map<string, StagedFile> {
   const absProjectDir = resolve(projectDir);
   const filePaths: string[] = [];
-  collectProjectFiles(absProjectDir, absProjectDir, filePaths, createProjectIgnore(absProjectDir));
+  collectProjectFiles(absProjectDir, absProjectDir, filePaths, projectIgnore(absProjectDir));
   if (!filePaths.includes("index.html")) {
     throw new Error(
       "Project archive must include index.html at the root. Check that .hyperframesignore does not exclude it.",
     );
   }
 
-  const fileContents = new Map<string, Buffer>();
+  const fileContents = new Map<string, StagedFile>();
+  const diskPathOf = new Map<string, string>();
   for (const filePath of filePaths) {
-    fileContents.set(filePath, readFileSync(join(absProjectDir, filePath)));
+    const key = archiveKey(filePath);
+    const clash = diskPathOf.get(key);
+    if (clash !== undefined) {
+      throw new Error(
+        `"${clash}" and "${filePath}" have the same name written in two Unicode forms and would overwrite each other in the archive. Rename one of them.`,
+      );
+    }
+    diskPathOf.set(key, filePath);
+    fileContents.set(key, stageFile(join(absProjectDir, filePath), onDiskMinBytes));
   }
 
-  localizeExternalAssets(absProjectDir, fileContents);
+  composeNamesInText(fileContents, filePaths);
+  localizeExternalAssets(absProjectDir, fileContents, onDiskMinBytes);
   return fileContents;
 }
 
@@ -561,7 +738,7 @@ export function buildPublishFileMap(projectDir: string): Map<string, Buffer> {
  * rather than of its contents, which is the opposite of what a
  * content-addressed artifact needs.
  *
- * Built from local components on purpose: `fromDate2DOS` reads `getFullYear`,
+ * Built from local components on purpose: adm-zip's DOS date encoding reads `getFullYear`,
  * `getMonth`, `getHours` and friends, so a fixed *instant* would still encode
  * differently in different timezones. Fixing the wall-clock reading is what
  * makes the bytes match across machines. 1980-01-01 is the earliest a DOS

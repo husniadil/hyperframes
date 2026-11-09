@@ -35,9 +35,12 @@
  *     same behavior as before this PR.
  */
 
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EngineConfig } from "@hyperframes/engine";
 import { suggestMatchingPreset, type CanvasResolution } from "@hyperframes/core";
+import { extractStandaloneEntryFromIndex, isTemplateEntry } from "@hyperframes/core/compiler";
+import { readTextFile } from "@hyperframes/parsers/asset-resolution";
 import type { CompiledComposition } from "../../htmlCompiler.js";
 import { compileForRender } from "../../htmlCompiler.js";
 import type { ProducerLogger } from "../../../logger.js";
@@ -53,9 +56,7 @@ import { preflightCompositionAssetMediaTypes } from "../../assetMediaType.js";
 export interface CompileStageInput {
   projectDir: string;
   workDir: string;
-  /** Absolute path to the entry HTML (already resolved to standalone-entry if needed). */
-  htmlPath: string;
-  /** The relative `entryFile` string, used only for log payloads. */
+  /** Entry HTML relative to `projectDir`; a `<template>` sub-composition is isolated inside the index shell. */
   entryFile: string;
   job: RenderJob;
   /**
@@ -89,6 +90,10 @@ export interface CompileStageInput {
   allowSystemFontCapture?: boolean;
   /** Render-time variable overrides (`--variables`); see CompileForRenderOptions.variables. */
   variables?: Record<string, unknown>;
+  /** Absolute project paths not on disk, readable at these URLs instead. */
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>;
+  /** See RenderConfig.pageMotionBlur; decides whether the page renders through screenshots. */
+  pageMotionBlur?: "off";
 }
 
 export interface CompileStageResult {
@@ -109,7 +114,7 @@ export interface CompileStageResult {
    */
   forceScreenshot: boolean;
   /** Low-cardinality compile-time gate that disabled default drawElement:
-   * `3d` | `mix_blend_mode` | `shader_transitions`. Undefined when none fired. */
+   * `3d` | `ancestor_background_image` | `shader_transitions`. Undefined when none fired. */
   deCompileGate?: string;
 }
 
@@ -148,11 +153,48 @@ function adaptAspectAgnosticResolution(
   return flipped;
 }
 
+/**
+ * The HTML file to compile for `entryFile`. A `<template>`-wrapped
+ * sub-composition has no live root, timeline or duration of its own, so it is
+ * rendered through the project's index.html shell with only its mount host kept.
+ */
+export function resolveEntryHtmlPath(input: {
+  projectDir: string;
+  workDir: string;
+  entryFile: string;
+  log: ProducerLogger;
+}): string {
+  const { projectDir, workDir, entryFile, log } = input;
+  const htmlPath = join(projectDir, entryFile);
+  const rawEntry = readTextFile(htmlPath);
+  if (entryFile === "index.html" || !isTemplateEntry(rawEntry)) return htmlPath;
+
+  const projectIndexPath = join(projectDir, "index.html");
+  if (!existsSync(projectIndexPath)) {
+    throw new Error(
+      `Template entry file "${entryFile}" requires a project index.html to extract its render shell.`,
+    );
+  }
+  const standaloneHtml = extractStandaloneEntryFromIndex(
+    readTextFile(projectIndexPath),
+    entryFile,
+    rawEntry,
+  );
+  if (!standaloneHtml) {
+    throw new Error(
+      `Entry file "${entryFile}" is not mounted from index.html via data-composition-src, so it cannot be rendered independently.`,
+    );
+  }
+  const wrapperPath = join(workDir, "standalone-entry.html");
+  writeFileSync(wrapperPath, standaloneHtml, "utf-8");
+  log.info("Extracted standalone entry from index.html host context", { entryFile });
+  return wrapperPath;
+}
+
 export async function runCompileStage(input: CompileStageInput): Promise<CompileStageResult> {
   const {
     projectDir,
     workDir,
-    htmlPath,
     entryFile,
     job,
     cfg,
@@ -164,6 +206,7 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
     abortSignal,
   } = input;
 
+  const htmlPath = resolveEntryHtmlPath({ projectDir, workDir, entryFile, log });
   const compileStart = Date.now();
   const compiled = await compileForRender(projectDir, htmlPath, join(workDir, "downloads"), {
     log,
@@ -171,6 +214,8 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
     allowSystemFontCapture,
     abortSignal,
     variables: input.variables,
+    urlByAbsentLocalPath: input.urlByAbsentLocalPath,
+    pageMotionBlur: input.pageMotionBlur,
     animatedGifCacheDir: cfg.extractCacheDir
       ? join(cfg.extractCacheDir, "animated-gif")
       : undefined,
@@ -220,24 +265,6 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
     log.info(
       "[Render] Fast capture: composition uses a CSS 3D rendering context " +
         "(perspective / preserve-3d / backface-visibility), so disabling drawElementImage " +
-        "for this render. Capture uses the platform's baseline route.",
-    );
-  }
-  // Fast-capture mix-blend-mode gate, same shape as the 3D gate above.
-  // drawElementImage captures each element's paint records before the
-  // compositor resolves blend equations — blended layers render as if
-  // mix-blend-mode were absent, producing saturated/damaged composites
-  // (measured: 42 dB min vs 53 dB floor on real blend+filter comps, macOS GPU).
-  // HF_FAST_CAPTURE_BLEND=true bypasses for R&D.
-  if (
-    cfg.useDrawElement &&
-    process.env.HF_FAST_CAPTURE_BLEND !== "true" &&
-    compiled.usesMixBlendMode
-  ) {
-    cfg.useDrawElement = false;
-    deCompileGate = "mix_blend_mode";
-    log.info(
-      "[Render] Fast capture: composition uses mix-blend-mode, so disabling drawElementImage " +
         "for this render. Capture uses the platform's baseline route.",
     );
   }
@@ -310,6 +337,7 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
     videos: compiled.videos,
     audios: compiled.audios,
     images: compiled.images,
+    gradedCanvas: compiled.gradedCanvas,
     masterFxChain: compiled.masterFxChain,
     width: compiled.width,
     height: compiled.height,

@@ -1,3 +1,4 @@
+import { wallClearTimeout, wallSetTimeout } from "./wallClock";
 import {
   SVG_REFERENCE_ALIASES_ATTR,
   readSvgReferenceAliases,
@@ -17,9 +18,11 @@ import { parseImportMap } from "../compiler/importMaps";
 import { hasSameLink } from "../compiler/scriptRuns";
 import {
   namespaceCollidingSvgIds,
+  sceneClipRoots,
   rewriteSvgIdReferencesInCss,
 } from "../compiler/svgIdNamespacing";
 import { waitForFonts } from "./afterFonts";
+import { applyTextBindings } from "./applyVariableBindings";
 import { parseLayoutDimension } from "./compositionDimension";
 import { markFlattenedInnerRoot } from "./flattenedRoot";
 import {
@@ -193,12 +196,12 @@ const waitForExternalScriptLoad = (
   new Promise((resolve) => {
     let settled = false;
     const startedAt = Date.now();
-    let timeoutId: number | null = null;
+    let timeoutId: ReturnType<typeof wallSetTimeout> | null = null;
     const settle = (status: "load" | "error" | "timeout") => {
       if (settled) return;
       settled = true;
       if (timeoutId != null) {
-        window.clearTimeout(timeoutId);
+        wallClearTimeout(timeoutId);
       }
       resolve({
         status,
@@ -207,7 +210,7 @@ const waitForExternalScriptLoad = (
     };
     scriptEl.addEventListener("load", () => settle("load"), { once: true });
     scriptEl.addEventListener("error", () => settle("error"), { once: true });
-    timeoutId = window.setTimeout(() => settle("timeout"), EXTERNAL_SCRIPT_LOAD_TIMEOUT_MS);
+    timeoutId = wallSetTimeout(() => settle("timeout"), EXTERNAL_SCRIPT_LOAD_TIMEOUT_MS);
   });
 
 function resetCompositionHost(host: Element) {
@@ -605,6 +608,7 @@ async function mountCompositionContent(params: {
     runScripts: async () => {
       if (scriptPayloads.length > 0) await waitForFonts();
       if (!isCurrent()) return;
+      applyTextBindings(document, params.host);
       for (const scriptPayload of scriptPayloads) {
         const injectedScript = document.createElement("script");
         if (scriptPayload.type) {
@@ -886,9 +890,20 @@ export async function loadCompositions(params: LoadCompositionsParams): Promise<
 
 /** Reuse one finalization set across authored mounting and initial-script discovery. */
 function namespaceMountedSvgIds(
-  mounted: readonly MountedSvgScope[],
+  composed: readonly MountedSvgScope[],
   finalizedIds: Set<Element>,
 ): void {
+  const hosts = composed
+    .filter((scope) => scope.referenceTarget !== "document")
+    .map(({ host }) => host);
+  const mounted: MountedSvgScope[] = [
+    ...composed,
+    ...sceneClipRoots(document, hosts).map((host, index) => ({
+      host,
+      namespace: `clip-${index}`,
+      styles: [],
+    })),
+  ];
   for (const { styles } of mounted) {
     for (const style of styles) {
       const current = style.element.textContent ?? "";

@@ -9,7 +9,9 @@ import {
   relative as nodeRelative,
   isAbsolute as nodeIsAbsolute,
 } from "node:path";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { decodedUrlPath } from "@hyperframes/parsers/asset-paths";
 
 export interface RenderPaths {
   absoluteProjectDir: string;
@@ -27,6 +29,8 @@ type PathModuleLike = {
   relative: (from: string, to: string) => string;
   isAbsolute: (path: string) => boolean;
 };
+
+const LEADING_PARENT_SEGMENT_RE = /^\.\.(?:[\\/]|$)/;
 
 type IsPathInsideOptions = {
   pathModule?: PathModuleLike;
@@ -59,7 +63,7 @@ export function isPathInside(
   // `relative()` returns "" when paths are equal, ".." or "..\\foo" when child
   // is above the parent, and an absolute path when they live on different
   // drives/volumes (Windows) — none of which count as "inside".
-  return rel !== "" && !rel.startsWith("..") && !isPathAbsolute(rel);
+  return rel !== "" && !LEADING_PARENT_SEGMENT_RE.test(rel) && !isPathAbsolute(rel);
 }
 
 /**
@@ -131,4 +135,13 @@ export function resolveRenderPaths(
   const absoluteOutputPath = nodeResolve(resolvedOutputPath);
 
   return { absoluteProjectDir, absoluteOutputPath };
+}
+
+/** The project file a data-composition-src names, as the preview reads it; null when it leaves the project. */
+export function resolveCompositionSrc(projectDir: string, src: string): string | null {
+  const rooted = (value: string) => nodeResolve(projectDir, value.replace(/^(?:\.?[\\/])+/, ""));
+  const decoded = rooted(decodedUrlPath(src));
+  if (!isPathInside(decoded, projectDir)) return null;
+  const raw = rooted(src);
+  return !existsSync(decoded) && isPathInside(raw, projectDir) && existsSync(raw) ? raw : decoded;
 }
